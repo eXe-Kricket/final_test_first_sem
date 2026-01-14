@@ -1,11 +1,36 @@
 #!/bin/bash
 
-# Установка зависимостей Go
-go mod init prices-server
+set -e
+
+# Инициализация модулей (если go.mod ещё нет)
+if [ ! -f go.mod ]; then
+    go mod init prices-api
+fi
+
 go mod tidy
 
-# Ждем, пока БД запустится
-sleep 5
+# Запуск PostgreSQL в Docker, если не запущен
+if ! docker ps | grep -q postgres-db; then
+    docker run --name postgres-db \
+        -e POSTGRES_USER=validator \
+        -e POSTGRES_PASSWORD=val1dat0r \
+        -e POSTGRES_DB=project-sem-1 \
+        -p 5432:5432 \
+        -d postgres:latest
+fi
 
-# Создаем таблицу (но в коде Go это уже есть, здесь для подготовки)
-psql -h localhost -p 5432 -U validator -d project-sem-1 -c "CREATE TABLE IF NOT EXISTS prices (id SERIAL PRIMARY KEY, item TEXT, category TEXT, price INTEGER);"
+# Ждём, пока PostgreSQL полностью запустится
+echo "Waiting for PostgreSQL to start..."
+sleep 12  # обычно хватает 8–15 сек
+
+# Создаём таблицу с передачей пароля
+PGPASSWORD=val1dat0r psql -h localhost -p 5432 -U validator -d project-sem-1 <<EOF
+CREATE TABLE IF NOT EXISTS prices (
+    id SERIAL PRIMARY KEY,
+    item TEXT,
+    category TEXT,
+    price INTEGER
+);
+EOF
+
+echo "Database prepared successfully."
