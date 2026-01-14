@@ -80,6 +80,20 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
+func pricesHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[REQUEST] %s %s%s | Content-Type: %q | Content-Length: %d",
+		r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Get("Content-Type"), r.ContentLength)
+
+	switch r.Method {
+	case http.MethodPost:
+		handlePost(w, r)
+	case http.MethodGet:
+		handleGet(w, r)
+	default:
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 func handlePost(w http.ResponseWriter, r *http.Request) {
 	// Логируем всё, что приходит
 	log.Printf("[POST] Content-Type: %q | Query: %s", r.Header.Get("Content-Type"), r.URL.RawQuery)
