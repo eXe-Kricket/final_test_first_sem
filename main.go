@@ -95,25 +95,28 @@ func pricesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlePost(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[POST] Content-Type: %q | Content-Length: %d", r.Header.Get("Content-Type"), r.ContentLength)
+	log.Printf("[POST] Content-Type: %q | Content-Length: %d | Query: %s",
+		r.Header.Get("Content-Type"), r.ContentLength, r.URL.RawQuery)
 
-	// Парсим multipart/form-data (основной формат в тестах)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
+	// Обязательно парсим multipart/form-data — тесты используют именно его
+	if err := r.ParseMultipartForm(10 << 20); err != nil { // лимит 10 МБ
 		log.Printf("[ERROR] ParseMultipartForm failed: %v", err)
-		http.Error(w, "Не удалось разобрать multipart/form-data", http.StatusBadRequest)
+		http.Error(w, "Не удалось разобрать multipart", http.StatusBadRequest)
 		return
 	}
 
+	// Извлекаем файл из поля "file" — именно так тесты отправляют
 	file, header, err := r.FormFile("file")
 	if err != nil {
 		log.Printf("[ERROR] Поле 'file' не найдено: %v", err)
-		http.Error(w, "Отсутствует поле 'file' в запросе", http.StatusBadRequest)
+		http.Error(w, "Отсутствует поле file", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
 
 	log.Printf("[POST] Получен файл: %q, размер: %d байт", header.Filename, header.Size)
 
+	// Читаем содержимое загруженного файла (это уже чистый ZIP)
 	body, err := io.ReadAll(file)
 	if err != nil {
 		log.Printf("[ERROR] Ошибка чтения файла: %v", err)
@@ -121,18 +124,12 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[POST] Размер тела файла: %d байт", len(body))
-
-	if len(body) == 0 {
-		log.Println("[ERROR] Получен пустой файл")
-		http.Error(w, "Пустой файл", http.StatusBadRequest)
-		return
-	}
+	log.Printf("[POST] Размер ZIP: %d байт", len(body))
 
 	zipReader, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
 	if err != nil {
-		log.Printf("[ERROR] Не удалось распарсить ZIP: %v", err)
-		http.Error(w, "Невозможно распарсить как ZIP", http.StatusBadRequest)
+		log.Printf("[ERROR] ZIP parse error: %v", err)
+		http.Error(w, "Некорректный ZIP-архив", http.StatusBadRequest)
 		return
 	}
 
@@ -143,10 +140,9 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 	var foundCSV bool
 
 	for _, file := range zipReader.File {
-		log.Printf("[ZIP] Файл: %s (размер %d байт)", file.Name, file.UncompressedSize64)
+		log.Printf("[ZIP] Обнаружен: %s (размер %d байт)", file.Name, file.UncompressedSize64)
 
-		if file.Name != "data.csv" && !strings.HasSuffix(strings.ToLower(file.Name), ".csv") {
-			log.Printf("[ZIP] Пропущен (не .csv): %s", file.Name)
+		if file.Name != "data.csv" && !strings.HasSuffix(file.Name, ".csv") {
 			continue
 		}
 
@@ -164,28 +160,21 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		csvReader.Comma = ','
 		csvReader.LazyQuotes = true
 
-		// Пропуск заголовка
-		header, err := csvReader.Read()
+		// Пропускаем заголовок
+		_, err = csvReader.Read()
 		if err != nil && err != io.EOF {
-			log.Printf("[ERROR] Ошибка чтения заголовка: %v", err)
-			http.Error(w, "Ошибка чтения заголовка CSV", http.StatusBadRequest)
+			log.Printf("[ERROR] Ошибка пропуска заголовка: %v", err)
+			http.Error(w, "Ошибка чтения заголовка", http.StatusBadRequest)
 			return
-		}
-		if header != nil {
-			log.Printf("[CSV] Заголовок: %v", header)
-		} else {
-			log.Println("[CSV] Нет заголовка — первая строка считается данными")
 		}
 
 		_, err = db.Exec("TRUNCATE TABLE prices")
 		if err != nil {
-			log.Printf("[ERROR] Ошибка TRUNCATE: %v", err)
+			log.Printf("[ERROR] TRUNCATE failed: %v", err)
 			http.Error(w, "Ошибка очистки таблицы", http.StatusInternalServerError)
 			return
 		}
-		log.Println("[DB] Таблица очищена")
 
-		rowCount := 0
 		for {
 			record, err := csvReader.Read()
 			if err == io.EOF {
@@ -193,17 +182,12 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 			}
 			if err != nil {
 				log.Printf("[ERROR] Ошибка чтения строки: %v", err)
-				http.Error(w, "Ошибка чтения CSV", http.StatusBadRequest)
+				http.Error(w, "Ошибка чтения строки CSV", http.StatusBadRequest)
 				return
 			}
 
-			rowCount++
-			if rowCount <= 5 {
-				log.Printf("[CSV] Строка %d: %v", rowCount, record)
-			}
-
 			if len(record) != 3 {
-				log.Printf("[ERROR] Строка %d: неверное кол-во колонок (%d)", rowCount, len(record))
+				log.Printf("[ERROR] Неверное кол-во колонок: %d", len(record))
 				http.Error(w, "Неверный формат CSV (3 колонки)", http.StatusBadRequest)
 				return
 			}
@@ -214,7 +198,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 
 			price, err := strconv.Atoi(priceStr)
 			if err != nil {
-				log.Printf("[ERROR] Строка %d: некорректная цена %q → %v", rowCount, priceStr, err)
+				log.Printf("[ERROR] Некорректная цена: %q → %v", priceStr, err)
 				http.Error(w, "Некорректная цена", http.StatusBadRequest)
 				return
 			}
@@ -222,7 +206,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 			_, err = db.Exec("INSERT INTO prices (item, category, price) VALUES ($1, $2, $3)",
 				item, category, price)
 			if err != nil {
-				log.Printf("[ERROR] Ошибка INSERT строка %d: %v", rowCount, err)
+				log.Printf("[ERROR] INSERT failed: %v", err)
 				http.Error(w, "Ошибка вставки в БД", http.StatusInternalServerError)
 				return
 			}
@@ -231,7 +215,6 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 			totalPrice += price
 			categories[category] = true
 		}
-		log.Printf("[CSV] Обработано строк: %d", rowCount)
 	}
 
 	if !foundCSV {
@@ -249,12 +232,9 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(stats); err != nil {
-		log.Printf("[ERROR] Ошибка кодирования JSON: %v", err)
-	}
+	json.NewEncoder(w).Encode(stats)
 
-	log.Printf("[POST SUCCESS] Добавлено: %d строк, категорий: %d, сумма: %d",
-		totalItems, len(categories), totalPrice)
+	log.Printf("[POST] Успех: %d строк, категорий %d, сумма %d", totalItems, len(categories), totalPrice)
 }
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
