@@ -1,5 +1,5 @@
-module project_sem
+module final_test_first_sem
 
-go 1.23.3
+go 1.25.2
 
 require github.com/lib/pq v1.10.9

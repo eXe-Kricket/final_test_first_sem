@@ -181,7 +181,18 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 		}
 		csvWriter.Write([]string{item, category, strconv.Itoa(price)})
 	}
+
+	// Проверяем ошибки после цикла
+	if err = rows.Err(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
 	csvWriter.Flush()
+	if err := csvWriter.Error(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	zipWriter.Close()
 
