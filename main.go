@@ -46,9 +46,11 @@ func main() {
 		if err := db.PingContext(ctx); err == nil {
 			break
 		}
+		log.Println("Waiting for postgres...")
 		time.Sleep(2 * time.Second)
 	}
 
+	// Создаём таблицу ДО запуска HTTP
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS prices (
 			id SERIAL PRIMARY KEY,
@@ -100,11 +102,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err = db.Exec("TRUNCATE TABLE prices")
-	if err != nil {
-		http.Error(w, "DB error", http.StatusInternalServerError)
-		return
-	}
+	db.Exec("TRUNCATE TABLE prices")
 
 	totalItems := 0
 	totalPrice := 0
