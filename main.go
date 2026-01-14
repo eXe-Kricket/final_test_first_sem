@@ -74,7 +74,9 @@ func main() {
 	}
 
 	log.Println("Таблица prices готова")
-
+	// Регистрируем HTTP-обработчики
+	http.HandleFunc("/api/v0/prices", pricesHandler)
+	http.HandleFunc("/api/v0/prices/", pricesHandler) // на случай если curl добавит слеш
 	// Запускаем HTTP-сервер
 	log.Println("Сервер запущен на :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
