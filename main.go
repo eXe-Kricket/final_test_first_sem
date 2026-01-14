@@ -80,56 +80,39 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
-func pricesHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[REQUEST] %s %s%s | Content-Type: %q | Content-Length: %d",
-		r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Get("Content-Type"), r.ContentLength)
-
-	switch r.Method {
-	case http.MethodPost:
-		handlePost(w, r)
-	case http.MethodGet:
-		handleGet(w, r)
-	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-	}
-}
-
 func handlePost(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[POST] Content-Type: %q | Content-Length: %d | Query: %s",
-		r.Header.Get("Content-Type"), r.ContentLength, r.URL.RawQuery)
+	// Логируем всё, что приходит
+	log.Printf("[POST] Content-Type: %q | Query: %s", r.Header.Get("Content-Type"), r.URL.RawQuery)
 
-	// Обязательно парсим multipart/form-data — тесты используют именно его
-	if err := r.ParseMultipartForm(10 << 20); err != nil { // лимит 10 МБ
-		log.Printf("[ERROR] ParseMultipartForm failed: %v", err)
-		http.Error(w, "Не удалось разобрать multipart", http.StatusBadRequest)
+	// Парсим multipart (обязательно!)
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		log.Printf("[ERROR] Multipart parse error: %v", err)
+		http.Error(w, "Multipart parse error", http.StatusBadRequest)
 		return
 	}
 
-	// Извлекаем файл из поля "file" — именно так тесты отправляют
 	file, header, err := r.FormFile("file")
 	if err != nil {
-		log.Printf("[ERROR] Поле 'file' не найдено: %v", err)
-		http.Error(w, "Отсутствует поле file", http.StatusBadRequest)
+		log.Printf("[ERROR] No 'file' field: %v", err)
+		http.Error(w, "No file field", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
 
-	log.Printf("[POST] Получен файл: %q, размер: %d байт", header.Filename, header.Size)
+	log.Printf("[POST] File received: %s, size %d", header.Filename, header.Size)
 
-	// Читаем содержимое загруженного файла (это уже чистый ZIP)
 	body, err := io.ReadAll(file)
 	if err != nil {
-		log.Printf("[ERROR] Ошибка чтения файла: %v", err)
-		http.Error(w, "Не удалось прочитать файл", http.StatusInternalServerError)
+		log.Printf("[ERROR] Read file error: %v", err)
+		http.Error(w, "Read file error", http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("[POST] Размер ZIP: %d байт", len(body))
-
+	// Дальше как раньше — парсим ZIP из body
 	zipReader, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
 	if err != nil {
-		log.Printf("[ERROR] ZIP parse error: %v", err)
-		http.Error(w, "Некорректный ZIP-архив", http.StatusBadRequest)
+		log.Printf("[ERROR] ZIP error: %v", err)
+		http.Error(w, "Invalid ZIP", http.StatusBadRequest)
 		return
 	}
 
