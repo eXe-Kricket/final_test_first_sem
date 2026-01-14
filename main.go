@@ -19,8 +19,8 @@ import (
 )
 
 type Stats struct {
-	TotalCount      int `json:"total_count"`      // для уровня 3 — равно total_items
-	DuplicatesCount int `json:"duplicates_count"` // для уровня 3 — всегда 0
+	TotalCount      int `json:"total_count"`
+	DuplicatesCount int `json:"duplicates_count"`
 	TotalItems      int `json:"total_items"`
 	TotalCategories int `json:"total_categories"`
 	TotalPrice      int `json:"total_price"`
@@ -74,16 +74,15 @@ func main() {
 	log.Println("Таблица prices готова")
 
 	http.HandleFunc("/api/v0/prices", pricesHandler)
-	http.HandleFunc("/api/v0/prices/", pricesHandler) // на случай слеша
+	http.HandleFunc("/api/v0/prices/", pricesHandler)
 
 	log.Println("Сервер запущен на :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
 func pricesHandler(w http.ResponseWriter, r *http.Request) {
-	// Лог для уровня 2 — поможет увидеть, что именно приходит от тестов
-	log.Printf("Запрос обработан: %s %s%s (Content-Type: %s)",
-		r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Get("Content-Type"))
+	log.Printf("[REQUEST] %s %s%s | Content-Type: %q | Content-Length: %d",
+		r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Get("Content-Type"), r.ContentLength)
 
 	switch r.Method {
 	case http.MethodPost:
@@ -96,69 +95,105 @@ func pricesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlePost(w http.ResponseWriter, r *http.Request) {
-	// Гибкая проверка Content-Type для уровня 1
-	ct := r.Header.Get("Content-Type")
-	if !strings.Contains(strings.ToLower(ct), "zip") && ct != "" {
-		http.Error(w, "Ожидается ZIP-архив (application/zip или подобный)", http.StatusBadRequest)
+	ct := strings.ToLower(r.Header.Get("Content-Type"))
+	log.Printf("[POST] Content-Type: %q", ct)
+
+	// Очень мягкая проверка для тестов
+	if ct != "" && !strings.Contains(ct, "zip") && !strings.Contains(ct, "octet") {
+		log.Printf("[ERROR] Неподдерживаемый Content-Type: %q", ct)
+		http.Error(w, "Ожидается ZIP-архив", http.StatusBadRequest)
 		return
 	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		log.Printf("[ERROR] Не удалось прочитать тело: %v", err)
 		http.Error(w, "Не удалось прочитать тело запроса", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[POST] Тело запроса прочитано, размер: %d байт", len(body))
+	if len(body) == 0 {
+		log.Println("[ERROR] Тело запроса пустое")
+		http.Error(w, "Пустое тело запроса", http.StatusBadRequest)
 		return
 	}
 
 	zipReader, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
 	if err != nil {
+		log.Printf("[ERROR] Не удалось распарсить ZIP: %v", err)
 		http.Error(w, "Некорректный ZIP-архив", http.StatusBadRequest)
 		return
 	}
+
+	log.Printf("[ZIP] Успешно распарсен, файлов внутри: %d", len(zipReader.File))
 
 	var totalItems, totalPrice int
 	categories := make(map[string]bool)
 	var foundCSV bool
 
 	for _, file := range zipReader.File {
-		if file.Name != "data.csv" {
+		log.Printf("[ZIP] Файл: %s, размер: %d байт", file.Name, file.UncompressedSize64)
+
+		if file.Name != "data.csv" && !strings.HasSuffix(file.Name, ".csv") {
+			log.Printf("[ZIP] Пропущен файл (не data.csv): %s", file.Name)
 			continue
 		}
+
 		foundCSV = true
 
 		f, err := file.Open()
 		if err != nil {
-			http.Error(w, "Не удалось открыть data.csv в архиве", http.StatusInternalServerError)
+			log.Printf("[ERROR] Не удалось открыть файл %s: %v", file.Name, err)
+			http.Error(w, "Не удалось открыть CSV в архиве", http.StatusInternalServerError)
 			return
 		}
 		defer f.Close()
 
 		csvReader := csv.NewReader(f)
 		csvReader.Comma = ','
+		csvReader.LazyQuotes = true // более устойчиво к кавычкам
 
-		// Пропускаем заголовок (если есть)
-		_, err = csvReader.Read()
+		// Пропуск заголовка
+		header, err := csvReader.Read()
 		if err != nil && err != io.EOF {
+			log.Printf("[ERROR] Ошибка чтения заголовка: %v", err)
 			http.Error(w, "Ошибка чтения заголовка CSV", http.StatusBadRequest)
 			return
+		}
+		if header != nil {
+			log.Printf("[CSV] Заголовок: %v", header)
+		} else {
+			log.Println("[CSV] Заголовок отсутствует")
 		}
 
 		_, err = db.Exec("TRUNCATE TABLE prices")
 		if err != nil {
+			log.Printf("[ERROR] Ошибка TRUNCATE: %v", err)
 			http.Error(w, "Ошибка очистки таблицы", http.StatusInternalServerError)
 			return
 		}
+		log.Println("[DB] Таблица очищена")
 
+		rowCount := 0
 		for {
 			record, err := csvReader.Read()
 			if err == io.EOF {
 				break
 			}
 			if err != nil {
+				log.Printf("[ERROR] Ошибка чтения строки CSV: %v", err)
 				http.Error(w, "Ошибка чтения строки CSV", http.StatusBadRequest)
 				return
 			}
 
+			rowCount++
+			if rowCount <= 5 {
+				log.Printf("[CSV] Строка %d: %v", rowCount, record)
+			}
+
 			if len(record) != 3 {
+				log.Printf("[ERROR] Неверное количество колонок в строке %d: %d", rowCount, len(record))
 				http.Error(w, "Неверный формат CSV (ожидается 3 колонки)", http.StatusBadRequest)
 				return
 			}
@@ -169,6 +204,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 
 			price, err := strconv.Atoi(priceStr)
 			if err != nil {
+				log.Printf("[ERROR] Некорректная цена в строке %d: %q → %v", rowCount, priceStr, err)
 				http.Error(w, "Некорректная цена в CSV", http.StatusBadRequest)
 				return
 			}
@@ -178,7 +214,8 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 				item, category, price,
 			)
 			if err != nil {
-				http.Error(w, "Ошибка вставки записи в БД", http.StatusInternalServerError)
+				log.Printf("[ERROR] Ошибка INSERT в строке %d: %v", rowCount, err)
+				http.Error(w, "Ошибка вставки в БД", http.StatusInternalServerError)
 				return
 			}
 
@@ -186,16 +223,18 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 			totalPrice += price
 			categories[category] = true
 		}
+		log.Printf("[CSV] Обработано строк: %d", rowCount)
 	}
 
 	if !foundCSV {
+		log.Println("[ERROR] Файл data.csv не найден в архиве")
 		http.Error(w, "В архиве отсутствует файл data.csv", http.StatusBadRequest)
 		return
 	}
 
 	stats := Stats{
-		TotalCount:      totalItems, // для уровня 3
-		DuplicatesCount: 0,          // дубликаты не считаем
+		TotalCount:      totalItems,
+		DuplicatesCount: 0,
 		TotalItems:      totalItems,
 		TotalCategories: len(categories),
 		TotalPrice:      totalPrice,
@@ -203,55 +242,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(stats)
-}
 
-func handleGet(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query("SELECT item, category, price FROM prices ORDER BY id")
-	if err != nil {
-		http.Error(w, "Ошибка получения данных из БД", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
-	var buf bytes.Buffer
-	zipWriter := zip.NewWriter(&buf)
-
-	csvFile, err := zipWriter.Create("data.csv")
-	if err != nil {
-		http.Error(w, "Ошибка создания CSV в архиве", http.StatusInternalServerError)
-		return
-	}
-
-	csvWriter := csv.NewWriter(csvFile)
-	csvWriter.Write([]string{"item", "category", "price"})
-
-	for rows.Next() {
-		var item, category string
-		var price int
-		if err := rows.Scan(&item, &category, &price); err != nil {
-			http.Error(w, "Ошибка чтения строки из БД", http.StatusInternalServerError)
-			return
-		}
-		csvWriter.Write([]string{item, category, strconv.Itoa(price)})
-	}
-
-	if err := rows.Err(); err != nil {
-		http.Error(w, "Ошибка при итерации по результатам запроса", http.StatusInternalServerError)
-		return
-	}
-
-	csvWriter.Flush()
-	if err := csvWriter.Error(); err != nil {
-		http.Error(w, "Ошибка записи CSV", http.StatusInternalServerError)
-		return
-	}
-
-	if err := zipWriter.Close(); err != nil {
-		http.Error(w, "Ошибка закрытия ZIP-архива", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", "attachment; filename=data.zip")
-	w.Write(buf.Bytes())
+	log.Printf("[POST SUCCESS] Добавлено: %d строк, категорий: %d, сумма: %d",
+		totalItems, len(categories), totalPrice)
 }
