@@ -1,36 +1,59 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-set -e
+# prepare.sh
+# Предназначен для случаев, когда PostgreSQL уже установлен и запущен локально
 
-# Инициализация модулей (если go.mod ещё нет)
+set -euo pipefail
+
+echo "Подготовка проекта (PostgreSQL считается уже установленным локально)"
+
+# 1. Инициализация Go-модуля, если его ещё нет
 if [ ! -f go.mod ]; then
-    go mod init prices-api
+    echo "Инициализация Go-модуля..."
+    go mod init prices-api || true
 fi
 
+# Установка / обновление зависимостей
+echo "Установка зависимостей..."
 go mod tidy
 
-# Запуск PostgreSQL в Docker, если не запущен
-if ! docker ps | grep -q postgres-db; then
-    docker run --name postgres-db \
-        -e POSTGRES_USER=validator \
-        -e POSTGRES_PASSWORD=val1dat0r \
-        -e POSTGRES_DB=project-sem-1 \
-        -p 5432:5432 \
-        -d postgres:latest
+# 2. Проверка, что PostgreSQL доступен
+echo "Проверка подключения к PostgreSQL..."
+
+if ! pg_isready -h localhost -p 5432 -U validator -d project-sem-1 -t 5 >/dev/null 2>&1; then
+    echo "Ошибка: PostgreSQL не запущен или недоступен на localhost:5432"
+    echo ""
+    echo "Убедитесь, что:"
+    echo "  • PostgreSQL запущен"
+    echo "  • Пользователь validator существует"
+    echo "  • Пароль: val1dat0r"
+    echo "  • База project-sem-1 создана"
+    echo ""
+    echo "Запустите PostgreSQL и создайте пользователя/базу, если нужно:"
+    echo "  sudo systemctl start postgresql"
+    echo "  sudo -u postgres createuser validator"
+    echo "  sudo -u postgres psql -c \"ALTER USER validator WITH PASSWORD 'val1dat0r';\""
+    echo "  sudo -u postgres createdb -O validator project-sem-1"
+    exit 1
 fi
 
-# Ждём, пока PostgreSQL полностью запустится
-echo "Waiting for PostgreSQL to start..."
-sleep 12  # обычно хватает 8–15 сек
+# 3. Создание таблицы (если не существует)
+echo "Создание таблицы prices (если отсутствует)..."
 
-# Создаём таблицу с передачей пароля
-PGPASSWORD=val1dat0r psql -h localhost -p 5432 -U validator -d project-sem-1 <<EOF
+PGPASSWORD=val1dat0r psql -h localhost -p 5432 -U validator -d project-sem-1 -c "
 CREATE TABLE IF NOT EXISTS prices (
-    id SERIAL PRIMARY KEY,
-    item TEXT,
-    category TEXT,
-    price INTEGER
+    id      SERIAL PRIMARY KEY,
+    item    TEXT NOT NULL,
+    category TEXT NOT NULL,
+    price   INTEGER NOT NULL
 );
-EOF
+" || {
+    echo "Ошибка при создании таблицы"
+    exit 1
+}
 
-echo "Database prepared successfully."
+echo ""
+echo "Подготовка завершена успешно"
+echo "Теперь можно запустить сервер командой:"
+echo "  ./scripts/run.sh"
+echo ""
