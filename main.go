@@ -82,23 +82,17 @@ func pricesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlePost(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(10 << 20); err != nil {
-		http.Error(w, "Bad multipart", http.StatusBadRequest)
+	defer r.Body.Close()
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read error", 400)
 		return
 	}
 
-	file, _, err := r.FormFile("file")
+	zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
 	if err != nil {
-		http.Error(w, "File missing", http.StatusBadRequest)
-		return
-	}
-	defer file.Close()
-
-	body, _ := io.ReadAll(file)
-
-	zipReader, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
-	if err != nil {
-		http.Error(w, "Invalid zip", http.StatusBadRequest)
+		http.Error(w, "invalid zip", 400)
 		return
 	}
 
@@ -109,19 +103,19 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 	categories := map[string]bool{}
 	found := false
 
-	for _, zf := range zipReader.File {
-		if !strings.HasSuffix(zf.Name, ".csv") {
+	for _, f := range zr.File {
+		if !strings.HasSuffix(f.Name, ".csv") {
 			continue
 		}
 		found = true
 
-		f, _ := zf.Open()
-		defer f.Close()
+		rc, err := f.Open()
+		if err != nil {
+			continue
+		}
 
-		reader := csv.NewReader(f)
-
-		// skip header
-		reader.Read()
+		reader := csv.NewReader(rc)
+		reader.Read() // skip header
 
 		for {
 			row, err := reader.Read()
@@ -129,30 +123,22 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			if err != nil {
-				http.Error(w, "CSV error", http.StatusBadRequest)
-				return
-			}
-
-			// id,name,category,price,create_date
-			if len(row) != 5 {
-				http.Error(w, "Bad CSV format", http.StatusBadRequest)
+				rc.Close()
+				http.Error(w, "csv error", 400)
 				return
 			}
 
 			name := row[1]
 			category := row[2]
-			price, err := strconv.Atoi(row[3])
-			if err != nil {
-				http.Error(w, "Bad price", http.StatusBadRequest)
-				return
-			}
+			price, _ := strconv.Atoi(row[3])
 
 			_, err = db.Exec(
-				"INSERT INTO prices (name, category, price) VALUES ($1,$2,$3)",
+				"INSERT INTO prices(name, category, price) VALUES ($1,$2,$3)",
 				name, category, price,
 			)
 			if err != nil {
-				http.Error(w, "DB insert error", http.StatusInternalServerError)
+				rc.Close()
+				http.Error(w, "db error", 500)
 				return
 			}
 
@@ -160,21 +146,20 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 			totalPrice += price
 			categories[category] = true
 		}
+
+		rc.Close()
 	}
 
 	if !found {
-		http.Error(w, "CSV not found", http.StatusBadRequest)
+		http.Error(w, "csv not found", 400)
 		return
 	}
 
-	resp := Stats{
+	json.NewEncoder(w).Encode(Stats{
 		TotalItems:      totalItems,
 		TotalCategories: len(categories),
 		TotalPrice:      totalPrice,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	})
 }
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
