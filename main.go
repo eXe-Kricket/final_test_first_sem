@@ -178,32 +178,28 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query("SELECT name, category, price FROM prices ORDER BY id")
-	if err != nil {
-		http.Error(w, "DB error", http.StatusInternalServerError)
-		return
-	}
-	defer rows.Close()
-
 	var buf bytes.Buffer
 	zipWriter := zip.NewWriter(&buf)
 
 	csvFile, _ := zipWriter.Create("data.csv")
 	csvWriter := csv.NewWriter(csvFile)
-
 	csvWriter.Write([]string{"name", "category", "price"})
 
-	for rows.Next() {
-		var name, category string
-		var price int
-		rows.Scan(&name, &category, &price)
-		csvWriter.Write([]string{name, category, strconv.Itoa(price)})
+	rows, err := db.Query("SELECT name, category, price FROM prices ORDER BY id")
+	if err == nil {
+		for rows.Next() {
+			var n, c string
+			var p int
+			rows.Scan(&n, &c, &p)
+			csvWriter.Write([]string{n, c, strconv.Itoa(p)})
+		}
+		rows.Close()
 	}
 
 	csvWriter.Flush()
 	zipWriter.Close()
 
 	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", "attachment; filename=data.zip")
+	w.WriteHeader(http.StatusOK)
 	w.Write(buf.Bytes())
 }
