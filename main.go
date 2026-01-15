@@ -19,6 +19,8 @@ import (
 )
 
 type Stats struct {
+	TotalCount      int `json:"total_count"`      // уровень 3
+	DuplicatesCount int `json:"duplicates_count"` // уровень 3
 	TotalItems      int `json:"total_items"`
 	TotalCategories int `json:"total_categories"`
 	TotalPrice      int `json:"total_price"`
@@ -82,14 +84,17 @@ func pricesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlePost(w http.ResponseWriter, r *http.Request) {
-	err := r.ParseMultipartForm(32 << 20)
-	if err != nil {
+	log.Printf("[POST] Content-Type: %q | Query: %s", r.Header.Get("Content-Type"), r.URL.RawQuery)
+
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		log.Printf("[ERROR] Multipart error: %v", err)
 		http.Error(w, "multipart error", http.StatusBadRequest)
 		return
 	}
 
-	file, _, err := r.FormFile("file")
+	file, header, err := r.FormFile("file")
 	if err != nil {
+		log.Printf("[ERROR] No file field: %v", err)
 		http.Error(w, "file missing", http.StatusBadRequest)
 		return
 	}
@@ -97,13 +102,13 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(file)
 	if err != nil {
-		http.Error(w, "read error", 400)
+		http.Error(w, "read error", http.StatusBadRequest)
 		return
 	}
 
 	zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
 	if err != nil {
-		http.Error(w, "invalid zip", 400)
+		http.Error(w, "invalid zip", http.StatusBadRequest)
 		return
 	}
 
@@ -124,9 +129,14 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue
 		}
+		defer rc.Close()
 
 		reader := csv.NewReader(rc)
-		reader.Read() // header
+		reader.Comma = ','
+		reader.LazyQuotes = true
+
+		// Пропуск первой строки (заголовок или данные)
+		_, _ = reader.Read() // игнорируем ошибку, если нет заголовка
 
 		for {
 			row, err := reader.Read()
@@ -155,8 +165,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 				name, category, price,
 			)
 			if err != nil {
-				rc.Close()
-				http.Error(w, "db error", 500)
+				http.Error(w, "db error", http.StatusInternalServerError)
 				return
 			}
 
@@ -164,17 +173,17 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 			totalPrice += price
 			categories[category] = true
 		}
-
-		rc.Close()
 	}
 
 	if !found {
-		http.Error(w, "csv not found", 400)
+		http.Error(w, "csv not found", http.StatusBadRequest)
 		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(Stats{
+		TotalCount:      totalItems,
+		DuplicatesCount: 0,
 		TotalItems:      totalItems,
 		TotalCategories: len(categories),
 		TotalPrice:      totalPrice,
@@ -182,28 +191,32 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
+	rows, err := db.Query("SELECT name, category, price FROM prices ORDER BY id")
+	if err != nil {
+		http.Error(w, "db query error", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
 	var buf bytes.Buffer
 	zipWriter := zip.NewWriter(&buf)
-
 	csvFile, _ := zipWriter.Create("data.csv")
 	csvWriter := csv.NewWriter(csvFile)
 	csvWriter.Write([]string{"name", "category", "price"})
 
-	rows, err := db.Query("SELECT name, category, price FROM prices ORDER BY id")
-	if err == nil {
-		for rows.Next() {
-			var n, c string
-			var p int
-			rows.Scan(&n, &c, &p)
-			csvWriter.Write([]string{n, c, strconv.Itoa(p)})
+	for rows.Next() {
+		var n, c string
+		var p int
+		if err := rows.Scan(&n, &c, &p); err != nil {
+			continue
 		}
-		rows.Close()
+		csvWriter.Write([]string{n, c, strconv.Itoa(p)})
 	}
 
 	csvWriter.Flush()
 	zipWriter.Close()
 
 	w.Header().Set("Content-Type", "application/zip")
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Disposition", "attachment; filename=data.zip")
 	w.Write(buf.Bytes())
 }
