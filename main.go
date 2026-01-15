@@ -82,9 +82,20 @@ func pricesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlePost(w http.ResponseWriter, r *http.Request) {
-	defer r.Body.Close()
+	err := r.ParseMultipartForm(32 << 20)
+	if err != nil {
+		http.Error(w, "multipart error", http.StatusBadRequest)
+		return
+	}
 
-	body, err := io.ReadAll(r.Body)
+	file, _, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "file missing", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	body, err := io.ReadAll(file)
 	if err != nil {
 		http.Error(w, "read error", 400)
 		return
@@ -96,7 +107,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	db.Exec("TRUNCATE TABLE prices")
+	_, _ = db.Exec("TRUNCATE TABLE prices")
 
 	totalItems := 0
 	totalPrice := 0
@@ -115,7 +126,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		}
 
 		reader := csv.NewReader(rc)
-		reader.Read() // skip header
+		reader.Read() // header
 
 		for {
 			row, err := reader.Read()
@@ -155,6 +166,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(Stats{
 		TotalItems:      totalItems,
 		TotalCategories: len(categories),
