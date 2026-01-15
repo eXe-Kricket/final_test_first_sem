@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
 	"context"
@@ -52,21 +53,21 @@ func main() {
 		time.Sleep(2 * time.Second)
 	}
 
+	// Создаем таблицу с дополнительными полями для уровня 3
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS prices (
 			id SERIAL PRIMARY KEY,
 			name TEXT NOT NULL,
 			category TEXT NOT NULL,
 			price INTEGER NOT NULL,
-			UNIQUE(name, category, price)
+			create_date DATE,
+			UNIQUE(name, category, price, create_date)
 		)`)
 	if err != nil {
 		log.Fatalf("Ошибка создания таблицы: %v", err)
 	}
 
 	http.HandleFunc("/api/v0/prices", pricesHandler)
-	http.HandleFunc("/api/v0/prices/", pricesHandler)
-
 	log.Println("Слушаем на :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
@@ -83,12 +84,14 @@ func pricesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlePost(w http.ResponseWriter, r *http.Request) {
+	queryType := r.URL.Query().Get("type")
+	
 	if err := r.ParseMultipartForm(10 << 20); err != nil {
 		http.Error(w, "ошибка multipart", http.StatusBadRequest)
 		return
 	}
 
-	file, _, err := r.FormFile("file")
+	file, header, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "файл отсутствует", http.StatusBadRequest)
 		return
@@ -101,13 +104,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
-	if err != nil {
-		http.Error(w, "неверный zip", http.StatusBadRequest)
-		return
-	}
-
-	// Очищаем существующие данные
+	// Очищаем существующие данные перед каждой загрузкой
 	_, err = db.Exec("TRUNCATE TABLE prices")
 	if err != nil {
 		http.Error(w, "ошибка БД", http.StatusInternalServerError)
@@ -120,122 +117,58 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 	totalPrice := 0
 	categories := make(map[string]bool)
 	seenItems := make(map[string]bool)
-	foundCSV := false
 
-	for _, f := range zr.File {
-		if !strings.HasSuffix(f.Name, ".csv") {
-			continue
-		}
-		foundCSV = true
-
-		rc, err := f.Open()
+	// Обработка ZIP архива
+	if queryType == "zip" || queryType == "" {
+		zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
 		if err != nil {
-			continue
-		}
-		defer rc.Close()
-
-		reader := csv.NewReader(rc)
-		reader.Comma = ','
-		reader.LazyQuotes = true
-
-		// Читаем все строки
-		rows, err := reader.ReadAll()
-		if err != nil {
-			http.Error(w, "ошибка парсинга CSV", http.StatusBadRequest)
+			http.Error(w, "неверный zip архив", http.StatusBadRequest)
 			return
 		}
 
-		// Определяем индексы колонок
-		var nameIdx, categoryIdx, priceIdx = -1, -1, -1
-
-		if len(rows) > 0 {
-			// Пытаемся найти строку заголовка
-			for i, cell := range rows[0] {
-				cellLower := strings.ToLower(strings.TrimSpace(cell))
-				switch cellLower {
-				case "name", "product", "item":
-					nameIdx = i
-				case "category", "type":
-					categoryIdx = i
-				case "price", "cost":
-					priceIdx = i
-				}
-			}
-
-			// Если заголовок не найден, предполагаем порядок: name, category, price
-			if nameIdx == -1 || categoryIdx == -1 || priceIdx == -1 {
-				if len(rows[0]) >= 3 {
-					nameIdx = 0
-					categoryIdx = 1
-					priceIdx = 2
-				}
-			}
-		}
-
-		startRow := 0
-		if nameIdx >= 0 && categoryIdx >= 0 && priceIdx >= 0 {
-			// Проверяем, является ли первая строка заголовком
-			firstCellLower := strings.ToLower(strings.TrimSpace(rows[0][0]))
-			if strings.Contains(firstCellLower, "name") ||
-				strings.Contains(firstCellLower, "category") ||
-				strings.Contains(firstCellLower, "price") {
-				startRow = 1
-			}
-		}
-
-		// Обрабатываем строки
-		for i := startRow; i < len(rows); i++ {
-			row := rows[i]
-			totalRowsProcessed++
-
-			if len(row) <= max(nameIdx, categoryIdx, priceIdx) {
+		for _, f := range zr.File {
+			if !strings.HasSuffix(f.Name, ".csv") {
 				continue
 			}
-
-			name := strings.TrimSpace(row[nameIdx])
-			category := strings.TrimSpace(row[categoryIdx])
-			priceStr := strings.TrimSpace(row[priceIdx])
-
-			if name == "" || category == "" || priceStr == "" {
-				continue
-			}
-
-			price, err := strconv.Atoi(priceStr)
+			
+			rc, err := f.Open()
 			if err != nil {
 				continue
 			}
+			defer rc.Close()
 
-			// Создаём уникальный ключ для обнаружения дубликатов
-			itemKey := fmt.Sprintf("%s|%s|%d", name, category, price)
-
-			if seenItems[itemKey] {
-				duplicatesCount++
-				continue
-			}
-			seenItems[itemKey] = true
-
-			// Вставляем в базу данных
-			_, err = db.Exec("INSERT INTO prices(name, category, price) VALUES ($1, $2, $3)",
-				name, category, price)
+			err = processCSV(rc, &totalRowsProcessed, &totalItemsInserted, &duplicatesCount, 
+				&totalPrice, categories, seenItems)
 			if err != nil {
-				// Проверяем, является ли ошибкой дубликата
-				if strings.Contains(err.Error(), "duplicate") ||
-					strings.Contains(err.Error(), "unique") {
-					duplicatesCount++
-					continue
-				}
-				http.Error(w, "ошибка БД", http.StatusInternalServerError)
+				http.Error(w, "ошибка обработки CSV", http.StatusBadRequest)
+				return
+			}
+		}
+	} 
+	// Обработка TAR архива (для уровня 2)
+	else if queryType == "tar" {
+		tr := tar.NewReader(bytes.NewReader(body))
+		for {
+			header, err := tr.Next()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				http.Error(w, "неверный tar архив", http.StatusBadRequest)
 				return
 			}
 
-			totalItemsInserted++
-			totalPrice += price
-			categories[category] = true
+			if strings.HasSuffix(header.Name, ".csv") {
+				err = processCSV(tr, &totalRowsProcessed, &totalItemsInserted, &duplicatesCount, 
+					&totalPrice, categories, seenItems)
+				if err != nil {
+					http.Error(w, "ошибка обработки CSV", http.StatusBadRequest)
+					return
+				}
+			}
 		}
-	}
-
-	if !foundCSV {
-		http.Error(w, "CSV не найден", http.StatusBadRequest)
+	} else {
+		http.Error(w, "неподдерживаемый тип архива", http.StatusBadRequest)
 		return
 	}
 
@@ -251,8 +184,169 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+func processCSV(r io.Reader, totalRowsProcessed, totalItemsInserted, duplicatesCount *int, 
+	totalPrice *int, categories map[string]bool, seenItems map[string]bool) error {
+	
+	reader := csv.NewReader(r)
+	reader.Comma = ','
+	reader.LazyQuotes = true
+
+	// Читаем первую строку для определения заголовков
+	headers, err := reader.Read()
+	if err != nil {
+		return err
+	}
+
+	// Определяем индексы колонок
+	nameIdx, categoryIdx, priceIdx, dateIdx := -1, -1, -1, -1
+	for i, header := range headers {
+		header = strings.ToLower(strings.TrimSpace(header))
+		switch {
+		case strings.Contains(header, "name") || strings.Contains(header, "product") || strings.Contains(header, "item"):
+			nameIdx = i
+		case strings.Contains(header, "category") || strings.Contains(header, "type"):
+			categoryIdx = i
+		case strings.Contains(header, "price") || strings.Contains(header, "cost"):
+			priceIdx = i
+		case strings.Contains(header, "date") || strings.Contains(header, "create"):
+			dateIdx = i
+		}
+	}
+
+	// Если не нашли заголовки, предполагаем стандартный порядок
+	if nameIdx == -1 && len(headers) >= 4 {
+		nameIdx = 1
+		categoryIdx = 2
+		priceIdx = 3
+		if len(headers) >= 5 {
+			dateIdx = 4
+		}
+	}
+
+	// Обрабатываем строки
+	for {
+		row, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			continue // Пропускаем некорректные строки
+		}
+
+		*totalRowsProcessed++
+
+		if nameIdx >= len(row) || categoryIdx >= len(row) || priceIdx >= len(row) {
+			continue
+		}
+
+		name := strings.TrimSpace(row[nameIdx])
+		category := strings.TrimSpace(row[categoryIdx])
+		priceStr := strings.TrimSpace(row[priceIdx])
+
+		if name == "" || category == "" || priceStr == "" {
+			continue
+		}
+
+		price, err := strconv.Atoi(priceStr)
+		if err != nil {
+			continue
+		}
+
+		// Обрабатываем дату (опционально)
+		var createDate *time.Time
+		if dateIdx != -1 && dateIdx < len(row) && row[dateIdx] != "" {
+			dateStr := strings.TrimSpace(row[dateIdx])
+			if parsedDate, err := time.Parse("2006-01-02", dateStr); err == nil {
+				createDate = &parsedDate
+			}
+		}
+
+		// Создаем уникальный ключ
+		dateKey := ""
+		if createDate != nil {
+			dateKey = createDate.Format("2006-01-02")
+		}
+		itemKey := fmt.Sprintf("%s|%s|%d|%s", name, category, price, dateKey)
+
+		if seenItems[itemKey] {
+			*duplicatesCount++
+			continue
+		}
+		seenItems[itemKey] = true
+
+		// Вставляем в базу данных
+		var errInsert error
+		if createDate != nil {
+			_, errInsert = db.Exec(
+				"INSERT INTO prices(name, category, price, create_date) VALUES ($1, $2, $3, $4)",
+				name, category, price, createDate)
+		} else {
+			_, errInsert = db.Exec(
+				"INSERT INTO prices(name, category, price) VALUES ($1, $2, $3)",
+				name, category, price)
+		}
+
+		if errInsert != nil {
+			if strings.Contains(errInsert.Error(), "duplicate") || 
+			   strings.Contains(errInsert.Error(), "unique") {
+				*duplicatesCount++
+				continue
+			}
+			return errInsert
+		}
+
+		*totalItemsInserted++
+		*totalPrice += price
+		categories[category] = true
+	}
+
+	return nil
+}
+
 func handleGet(w http.ResponseWriter, r *http.Request) {
-	rows, err := db.Query("SELECT name, category, price FROM prices ORDER BY id")
+	// Получаем параметры фильтрации
+	startDate := r.URL.Query().Get("start")
+	endDate := r.URL.Query().Get("end")
+	minPrice := r.URL.Query().Get("min")
+	maxPrice := r.URL.Query().Get("max")
+
+	// Строим SQL запрос с фильтрами
+	query := "SELECT name, category, price, create_date FROM prices WHERE 1=1"
+	args := []interface{}{}
+	argIdx := 1
+
+	if startDate != "" {
+		query += fmt.Sprintf(" AND create_date >= $%d", argIdx)
+		args = append(args, startDate)
+		argIdx++
+	}
+	if endDate != "" {
+		query += fmt.Sprintf(" AND create_date <= $%d", argIdx)
+		args = append(args, endDate)
+		argIdx++
+	}
+	if minPrice != "" {
+		query += fmt.Sprintf(" AND price >= $%d", argIdx)
+		if min, err := strconv.Atoi(minPrice); err == nil {
+			args = append(args, min)
+		} else {
+			args = append(args, 0)
+		}
+		argIdx++
+	}
+	if maxPrice != "" {
+		query += fmt.Sprintf(" AND price <= $%d", argIdx)
+		if max, err := strconv.Atoi(maxPrice); err == nil {
+			args = append(args, max)
+		} else {
+			args = append(args, 1000000)
+		}
+		argIdx++
+	}
+
+	query += " ORDER BY id"
+
+	rows, err := db.Query(query, args...)
 	if err != nil {
 		http.Error(w, "ошибка запроса БД", http.StatusInternalServerError)
 		return
@@ -263,17 +357,25 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 	zipWriter := zip.NewWriter(&buf)
 	csvFile, _ := zipWriter.Create("data.csv")
 	csvWriter := csv.NewWriter(csvFile)
-
+	
 	// Записываем заголовок
-	csvWriter.Write([]string{"name", "category", "price"})
+	csvWriter.Write([]string{"name", "category", "price", "create_date"})
 
 	for rows.Next() {
 		var name, category string
 		var price int
-		if err := rows.Scan(&name, &category, &price); err != nil {
+		var createDate sql.NullTime
+		
+		if err := rows.Scan(&name, &category, &price, &createDate); err != nil {
 			continue
 		}
-		csvWriter.Write([]string{name, category, strconv.Itoa(price)})
+		
+		dateStr := ""
+		if createDate.Valid {
+			dateStr = createDate.Time.Format("2006-01-02")
+		}
+		
+		csvWriter.Write([]string{name, category, strconv.Itoa(price), dateStr})
 	}
 
 	if err = rows.Err(); err != nil {
@@ -287,15 +389,4 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", "attachment; filename=data.zip")
 	w.Write(buf.Bytes())
-}
-
-func max(a, b, c int) int {
-	max := a
-	if b > max {
-		max = b
-	}
-	if c > max {
-		max = c
-	}
-	return max
 }
