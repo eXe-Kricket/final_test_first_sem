@@ -85,18 +85,21 @@ func pricesHandler(w http.ResponseWriter, r *http.Request) {
 
 func handlePost(w http.ResponseWriter, r *http.Request) {
 	queryType := r.URL.Query().Get("type")
-	
+
 	if err := r.ParseMultipartForm(10 << 20); err != nil {
 		http.Error(w, "ошибка multipart", http.StatusBadRequest)
 		return
 	}
 
-	file, header, err := r.FormFile("file")
+	file, fileHeader, err := r.FormFile("file")
 	if err != nil {
 		http.Error(w, "файл отсутствует", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
+
+	// Логирование информации о полученном файле
+	log.Printf("[POST] Получен файл: %s, размер: %d байт", fileHeader.Filename, fileHeader.Size)
 
 	body, err := io.ReadAll(file)
 	if err != nil {
@@ -130,23 +133,22 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 			if !strings.HasSuffix(f.Name, ".csv") {
 				continue
 			}
-			
+
 			rc, err := f.Open()
 			if err != nil {
 				continue
 			}
 			defer rc.Close()
 
-			err = processCSV(rc, &totalRowsProcessed, &totalItemsInserted, &duplicatesCount, 
+			err = processCSV(rc, &totalRowsProcessed, &totalItemsInserted, &duplicatesCount,
 				&totalPrice, categories, seenItems)
 			if err != nil {
 				http.Error(w, "ошибка обработки CSV", http.StatusBadRequest)
 				return
 			}
 		}
-	} 
-	// Обработка TAR архива (для уровня 2)
-	else if queryType == "tar" {
+	} else if queryType == "tar" {
+		// Обработка TAR архива (для уровня 2)
 		tr := tar.NewReader(bytes.NewReader(body))
 		for {
 			header, err := tr.Next()
@@ -159,7 +161,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 			}
 
 			if strings.HasSuffix(header.Name, ".csv") {
-				err = processCSV(tr, &totalRowsProcessed, &totalItemsInserted, &duplicatesCount, 
+				err = processCSV(tr, &totalRowsProcessed, &totalItemsInserted, &duplicatesCount,
 					&totalPrice, categories, seenItems)
 				if err != nil {
 					http.Error(w, "ошибка обработки CSV", http.StatusBadRequest)
@@ -184,9 +186,9 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-func processCSV(r io.Reader, totalRowsProcessed, totalItemsInserted, duplicatesCount *int, 
+func processCSV(r io.Reader, totalRowsProcessed, totalItemsInserted, duplicatesCount *int,
 	totalPrice *int, categories map[string]bool, seenItems map[string]bool) error {
-	
+
 	reader := csv.NewReader(r)
 	reader.Comma = ','
 	reader.LazyQuotes = true
@@ -287,8 +289,8 @@ func processCSV(r io.Reader, totalRowsProcessed, totalItemsInserted, duplicatesC
 		}
 
 		if errInsert != nil {
-			if strings.Contains(errInsert.Error(), "duplicate") || 
-			   strings.Contains(errInsert.Error(), "unique") {
+			if strings.Contains(errInsert.Error(), "duplicate") ||
+				strings.Contains(errInsert.Error(), "unique") {
 				*duplicatesCount++
 				continue
 			}
@@ -357,7 +359,7 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 	zipWriter := zip.NewWriter(&buf)
 	csvFile, _ := zipWriter.Create("data.csv")
 	csvWriter := csv.NewWriter(csvFile)
-	
+
 	// Записываем заголовок
 	csvWriter.Write([]string{"name", "category", "price", "create_date"})
 
@@ -365,16 +367,16 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 		var name, category string
 		var price int
 		var createDate sql.NullTime
-		
+
 		if err := rows.Scan(&name, &category, &price, &createDate); err != nil {
 			continue
 		}
-		
+
 		dateStr := ""
 		if createDate.Valid {
 			dateStr = createDate.Time.Format("2006-01-02")
 		}
-		
+
 		csvWriter.Write([]string{name, category, strconv.Itoa(price), dateStr})
 	}
 
