@@ -134,14 +134,21 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			if err != nil {
-				rc.Close()
-				http.Error(w, "csv error", 400)
-				return
+				continue
 			}
 
-			name := row[1]
-			category := row[2]
-			price, _ := strconv.Atoi(row[3])
+			if len(row) < 4 {
+				continue
+			}
+
+			name := strings.TrimSpace(row[1])
+			category := strings.TrimSpace(row[2])
+			priceStr := strings.TrimSpace(row[3])
+
+			price, err := strconv.Atoi(priceStr)
+			if err != nil {
+				continue
+			}
 
 			_, err = db.Exec(
 				"INSERT INTO prices(name, category, price) VALUES ($1,$2,$3)",
