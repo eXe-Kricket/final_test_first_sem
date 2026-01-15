@@ -19,8 +19,8 @@ import (
 )
 
 type Stats struct {
-	TotalCount      int `json:"total_count"`      // уровень 3
-	DuplicatesCount int `json:"duplicates_count"` // уровень 3
+	TotalCount      int `json:"total_count"`      // для уровня 3
+	DuplicatesCount int `json:"duplicates_count"` // для уровня 3 — 0
 	TotalItems      int `json:"total_items"`
 	TotalCategories int `json:"total_categories"`
 	TotalPrice      int `json:"total_price"`
@@ -41,9 +41,9 @@ func main() {
 	}
 	defer db.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Ждём PostgreSQL
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-
 	for {
 		if err := db.PingContext(ctx); err == nil {
 			break
@@ -52,15 +52,14 @@ func main() {
 		time.Sleep(2 * time.Second)
 	}
 
-	// Создаём таблицу ДО запуска HTTP
+	// Создаём таблицу
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS prices (
 			id SERIAL PRIMARY KEY,
 			name TEXT NOT NULL,
 			category TEXT NOT NULL,
 			price INTEGER NOT NULL
-		)
-	`)
+		)`)
 	if err != nil {
 		log.Fatalf("Table create error: %v", err)
 	}
@@ -73,6 +72,8 @@ func main() {
 }
 
 func pricesHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[REQUEST] %s %s%s | Content-Type: %q", r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Get("Content-Type"))
+
 	switch r.Method {
 	case http.MethodPost:
 		handlePost(w, r)
@@ -86,28 +87,33 @@ func pricesHandler(w http.ResponseWriter, r *http.Request) {
 func handlePost(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[POST] Content-Type: %q | Query: %s", r.Header.Get("Content-Type"), r.URL.RawQuery)
 
+	// Парсим multipart (как в тестах)
 	if err := r.ParseMultipartForm(10 << 20); err != nil {
-		log.Printf("[ERROR] Multipart error: %v", err)
+		log.Printf("[ERROR] Multipart parse failed: %v", err)
 		http.Error(w, "multipart error", http.StatusBadRequest)
 		return
 	}
 
-	file, _, err := r.FormFile("file") // ← здесь _ вместо header
+	file, header, err := r.FormFile("file")
 	if err != nil {
-		log.Printf("[ERROR] No file field: %v", err)
+		log.Printf("[ERROR] No 'file' field: %v", err)
 		http.Error(w, "file missing", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
 
+	log.Printf("[POST] File: %s, size %d", header.Filename, header.Size)
+
 	body, err := io.ReadAll(file)
 	if err != nil {
+		log.Printf("[ERROR] Read file error: %v", err)
 		http.Error(w, "read error", http.StatusBadRequest)
 		return
 	}
 
 	zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
 	if err != nil {
+		log.Printf("[ERROR] ZIP parse error: %v", err)
 		http.Error(w, "invalid zip", http.StatusBadRequest)
 		return
 	}
@@ -127,6 +133,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 
 		rc, err := f.Open()
 		if err != nil {
+			log.Printf("[ERROR] Open file error: %v", err)
 			continue
 		}
 		defer rc.Close()
@@ -135,8 +142,30 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		reader.Comma = ','
 		reader.LazyQuotes = true
 
-		// Пропуск первой строки (заголовок или данные)
-		_, _ = reader.Read() // игнорируем ошибку, если нет заголовка
+		// Пропуск заголовка (если есть)
+		firstRow, err := reader.Read()
+		if err == nil {
+			lower := strings.ToLower(strings.Join(firstRow, ","))
+			if strings.Contains(lower, "name") || strings.Contains(lower, "category") || strings.Contains(lower, "price") {
+				log.Println("[CSV] Header skipped")
+			} else {
+				// Это данные — обрабатываем первую строку
+				if len(firstRow) >= 4 {
+					name := strings.TrimSpace(firstRow[1])
+					category := strings.TrimSpace(firstRow[2])
+					priceStr := strings.TrimSpace(firstRow[3])
+					price, err := strconv.Atoi(priceStr)
+					if err == nil {
+						_, err = db.Exec("INSERT INTO prices(name, category, price) VALUES ($1,$2,$3)", name, category, price)
+						if err == nil {
+							totalItems++
+							totalPrice += price
+							categories[category] = true
+						}
+					}
+				}
+			}
+		}
 
 		for {
 			row, err := reader.Read()
@@ -144,6 +173,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			if err != nil {
+				log.Printf("[CSV] Read row error: %v", err)
 				continue
 			}
 
@@ -157,14 +187,13 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 
 			price, err := strconv.Atoi(priceStr)
 			if err != nil {
+				log.Printf("[CSV] Invalid price: %s", priceStr)
 				continue
 			}
 
-			_, err = db.Exec(
-				"INSERT INTO prices(name, category, price) VALUES ($1,$2,$3)",
-				name, category, price,
-			)
+			_, err = db.Exec("INSERT INTO prices(name, category, price) VALUES ($1,$2,$3)", name, category, price)
 			if err != nil {
+				log.Printf("[DB] Insert error: %v", err)
 				http.Error(w, "db error", http.StatusInternalServerError)
 				return
 			}
@@ -176,6 +205,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !found {
+		log.Println("[ERROR] CSV not found")
 		http.Error(w, "csv not found", http.StatusBadRequest)
 		return
 	}
