@@ -92,7 +92,7 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	file, _, err := r.FormFile("file")
+	file, _, err := r.FormFile("file") // ← здесь _ вместо header
 	if err != nil {
 		log.Printf("[ERROR] No file field: %v", err)
 		http.Error(w, "file missing", http.StatusBadRequest)
