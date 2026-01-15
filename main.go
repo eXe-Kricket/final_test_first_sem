@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -19,8 +20,8 @@ import (
 )
 
 type Stats struct {
-	TotalCount      int `json:"total_count"`      // для уровня 3
-	DuplicatesCount int `json:"duplicates_count"` // для уровня 3 — 0
+	TotalCount      int `json:"total_count"`
+	DuplicatesCount int `json:"duplicates_count"`
 	TotalItems      int `json:"total_items"`
 	TotalCategories int `json:"total_categories"`
 	TotalPrice      int `json:"total_price"`
@@ -37,103 +38,98 @@ func main() {
 	var err error
 	db, err = sql.Open("postgres", connStr)
 	if err != nil {
-		log.Fatalf("DB open error: %v", err)
+		log.Fatalf("Ошибка открытия БД: %v", err)
 	}
 	defer db.Close()
 
-	// Ждём PostgreSQL
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	for {
 		if err := db.PingContext(ctx); err == nil {
 			break
 		}
-		log.Println("Waiting for postgres...")
+		log.Println("Ожидание PostgreSQL...")
 		time.Sleep(2 * time.Second)
 	}
 
-	// Создаём таблицу
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS prices (
 			id SERIAL PRIMARY KEY,
 			name TEXT NOT NULL,
 			category TEXT NOT NULL,
-			price INTEGER NOT NULL
+			price INTEGER NOT NULL,
+			UNIQUE(name, category, price)
 		)`)
 	if err != nil {
-		log.Fatalf("Table create error: %v", err)
+		log.Fatalf("Ошибка создания таблицы: %v", err)
 	}
 
 	http.HandleFunc("/api/v0/prices", pricesHandler)
 	http.HandleFunc("/api/v0/prices/", pricesHandler)
 
-	log.Println("Listening on :8080")
+	log.Println("Слушаем на :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
 func pricesHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[REQUEST] %s %s%s | Content-Type: %q", r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Get("Content-Type"))
-
 	switch r.Method {
 	case http.MethodPost:
 		handlePost(w, r)
 	case http.MethodGet:
 		handleGet(w, r)
 	default:
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, "Метод не разрешён", http.StatusMethodNotAllowed)
 	}
 }
 
 func handlePost(w http.ResponseWriter, r *http.Request) {
-	log.Printf("[POST] Content-Type: %q | Query: %s", r.Header.Get("Content-Type"), r.URL.RawQuery)
-
-	// Парсим multipart (как в тестах)
 	if err := r.ParseMultipartForm(10 << 20); err != nil {
-		log.Printf("[ERROR] Multipart parse failed: %v", err)
-		http.Error(w, "multipart error", http.StatusBadRequest)
+		http.Error(w, "ошибка multipart", http.StatusBadRequest)
 		return
 	}
 
-	file, header, err := r.FormFile("file")
+	file, _, err := r.FormFile("file")
 	if err != nil {
-		log.Printf("[ERROR] No 'file' field: %v", err)
-		http.Error(w, "file missing", http.StatusBadRequest)
+		http.Error(w, "файл отсутствует", http.StatusBadRequest)
 		return
 	}
 	defer file.Close()
 
-	log.Printf("[POST] File: %s, size %d", header.Filename, header.Size)
-
 	body, err := io.ReadAll(file)
 	if err != nil {
-		log.Printf("[ERROR] Read file error: %v", err)
-		http.Error(w, "read error", http.StatusBadRequest)
+		http.Error(w, "ошибка чтения", http.StatusBadRequest)
 		return
 	}
 
 	zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
 	if err != nil {
-		log.Printf("[ERROR] ZIP parse error: %v", err)
-		http.Error(w, "invalid zip", http.StatusBadRequest)
+		http.Error(w, "неверный zip", http.StatusBadRequest)
 		return
 	}
 
-	_, _ = db.Exec("TRUNCATE TABLE prices")
+	// Очищаем существующие данные
+	_, err = db.Exec("TRUNCATE TABLE prices")
+	if err != nil {
+		http.Error(w, "ошибка БД", http.StatusInternalServerError)
+		return
+	}
 
-	totalItems := 0
+	totalRowsProcessed := 0
+	totalItemsInserted := 0
+	duplicatesCount := 0
 	totalPrice := 0
-	categories := map[string]bool{}
-	found := false
+	categories := make(map[string]bool)
+	seenItems := make(map[string]bool)
+	foundCSV := false
 
 	for _, f := range zr.File {
 		if !strings.HasSuffix(f.Name, ".csv") {
 			continue
 		}
-		found = true
+		foundCSV = true
 
 		rc, err := f.Open()
 		if err != nil {
-			log.Printf("[ERROR] Open file error: %v", err)
 			continue
 		}
 		defer rc.Close()
@@ -142,88 +138,123 @@ func handlePost(w http.ResponseWriter, r *http.Request) {
 		reader.Comma = ','
 		reader.LazyQuotes = true
 
-		// Пропуск заголовка (если есть)
-		firstRow, err := reader.Read()
-		if err == nil {
-			lower := strings.ToLower(strings.Join(firstRow, ","))
-			if strings.Contains(lower, "name") || strings.Contains(lower, "category") || strings.Contains(lower, "price") {
-				log.Println("[CSV] Header skipped")
-			} else {
-				// Это данные — обрабатываем первую строку
-				if len(firstRow) >= 4 {
-					name := strings.TrimSpace(firstRow[1])
-					category := strings.TrimSpace(firstRow[2])
-					priceStr := strings.TrimSpace(firstRow[3])
-					price, err := strconv.Atoi(priceStr)
-					if err == nil {
-						_, err = db.Exec("INSERT INTO prices(name, category, price) VALUES ($1,$2,$3)", name, category, price)
-						if err == nil {
-							totalItems++
-							totalPrice += price
-							categories[category] = true
-						}
-					}
+		// Читаем все строки
+		rows, err := reader.ReadAll()
+		if err != nil {
+			http.Error(w, "ошибка парсинга CSV", http.StatusBadRequest)
+			return
+		}
+
+		// Определяем индексы колонок
+		var nameIdx, categoryIdx, priceIdx = -1, -1, -1
+
+		if len(rows) > 0 {
+			// Пытаемся найти строку заголовка
+			for i, cell := range rows[0] {
+				cellLower := strings.ToLower(strings.TrimSpace(cell))
+				switch cellLower {
+				case "name", "product", "item":
+					nameIdx = i
+				case "category", "type":
+					categoryIdx = i
+				case "price", "cost":
+					priceIdx = i
+				}
+			}
+
+			// Если заголовок не найден, предполагаем порядок: name, category, price
+			if nameIdx == -1 || categoryIdx == -1 || priceIdx == -1 {
+				if len(rows[0]) >= 3 {
+					nameIdx = 0
+					categoryIdx = 1
+					priceIdx = 2
 				}
 			}
 		}
 
-		for {
-			row, err := reader.Read()
-			if err == io.EOF {
-				break
+		startRow := 0
+		if nameIdx >= 0 && categoryIdx >= 0 && priceIdx >= 0 {
+			// Проверяем, является ли первая строка заголовком
+			firstCellLower := strings.ToLower(strings.TrimSpace(rows[0][0]))
+			if strings.Contains(firstCellLower, "name") ||
+				strings.Contains(firstCellLower, "category") ||
+				strings.Contains(firstCellLower, "price") {
+				startRow = 1
 			}
-			if err != nil {
-				log.Printf("[CSV] Read row error: %v", err)
+		}
+
+		// Обрабатываем строки
+		for i := startRow; i < len(rows); i++ {
+			row := rows[i]
+			totalRowsProcessed++
+
+			if len(row) <= max(nameIdx, categoryIdx, priceIdx) {
 				continue
 			}
 
-			if len(row) < 4 {
+			name := strings.TrimSpace(row[nameIdx])
+			category := strings.TrimSpace(row[categoryIdx])
+			priceStr := strings.TrimSpace(row[priceIdx])
+
+			if name == "" || category == "" || priceStr == "" {
 				continue
 			}
-
-			name := strings.TrimSpace(row[1])
-			category := strings.TrimSpace(row[2])
-			priceStr := strings.TrimSpace(row[3])
 
 			price, err := strconv.Atoi(priceStr)
 			if err != nil {
-				log.Printf("[CSV] Invalid price: %s", priceStr)
 				continue
 			}
 
-			_, err = db.Exec("INSERT INTO prices(name, category, price) VALUES ($1,$2,$3)", name, category, price)
+			// Создаём уникальный ключ для обнаружения дубликатов
+			itemKey := fmt.Sprintf("%s|%s|%d", name, category, price)
+
+			if seenItems[itemKey] {
+				duplicatesCount++
+				continue
+			}
+			seenItems[itemKey] = true
+
+			// Вставляем в базу данных
+			_, err = db.Exec("INSERT INTO prices(name, category, price) VALUES ($1, $2, $3)",
+				name, category, price)
 			if err != nil {
-				log.Printf("[DB] Insert error: %v", err)
-				http.Error(w, "db error", http.StatusInternalServerError)
+				// Проверяем, является ли ошибкой дубликата
+				if strings.Contains(err.Error(), "duplicate") ||
+					strings.Contains(err.Error(), "unique") {
+					duplicatesCount++
+					continue
+				}
+				http.Error(w, "ошибка БД", http.StatusInternalServerError)
 				return
 			}
 
-			totalItems++
+			totalItemsInserted++
 			totalPrice += price
 			categories[category] = true
 		}
 	}
 
-	if !found {
-		log.Println("[ERROR] CSV not found")
-		http.Error(w, "csv not found", http.StatusBadRequest)
+	if !foundCSV {
+		http.Error(w, "CSV не найден", http.StatusBadRequest)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(Stats{
-		TotalCount:      totalItems,
-		DuplicatesCount: 0,
-		TotalItems:      totalItems,
+	response := Stats{
+		TotalCount:      totalRowsProcessed,
+		DuplicatesCount: duplicatesCount,
+		TotalItems:      totalItemsInserted,
 		TotalCategories: len(categories),
 		TotalPrice:      totalPrice,
-	})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
 }
 
 func handleGet(w http.ResponseWriter, r *http.Request) {
 	rows, err := db.Query("SELECT name, category, price FROM prices ORDER BY id")
 	if err != nil {
-		http.Error(w, "db query error", http.StatusInternalServerError)
+		http.Error(w, "ошибка запроса БД", http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -232,15 +263,22 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 	zipWriter := zip.NewWriter(&buf)
 	csvFile, _ := zipWriter.Create("data.csv")
 	csvWriter := csv.NewWriter(csvFile)
+
+	// Записываем заголовок
 	csvWriter.Write([]string{"name", "category", "price"})
 
 	for rows.Next() {
-		var n, c string
-		var p int
-		if err := rows.Scan(&n, &c, &p); err != nil {
+		var name, category string
+		var price int
+		if err := rows.Scan(&name, &category, &price); err != nil {
 			continue
 		}
-		csvWriter.Write([]string{n, c, strconv.Itoa(p)})
+		csvWriter.Write([]string{name, category, strconv.Itoa(price)})
+	}
+
+	if err = rows.Err(); err != nil {
+		http.Error(w, "ошибка БД", http.StatusInternalServerError)
+		return
 	}
 
 	csvWriter.Flush()
@@ -249,4 +287,15 @@ func handleGet(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", "attachment; filename=data.zip")
 	w.Write(buf.Bytes())
+}
+
+func max(a, b, c int) int {
+	max := a
+	if b > max {
+		max = b
+	}
+	if c > max {
+		max = c
+	}
+	return max
 }
