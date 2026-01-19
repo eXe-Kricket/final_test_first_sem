@@ -40,11 +40,16 @@ echo "Создание таблицы prices (если отсутствует)..
 
 PGPASSWORD=val1dat0r psql -h localhost -p 5432 -U validator -d project-sem-1 -c "
 CREATE TABLE IF NOT EXISTS prices (
-    id      SERIAL PRIMARY KEY,
-    item    TEXT NOT NULL,
-    category TEXT NOT NULL,
-    price   INTEGER NOT NULL
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    category VARCHAR(255) NOT NULL,
+    price DECIMAL(10,2) NOT NULL,
+    create_date TIMESTAMP NOT NULL
 );
+
+-- уникальность записи: совпадение всех полей кроме id
+CREATE UNIQUE INDEX IF NOT EXISTS prices_unique_idx
+ON prices (name, category, price, create_date);
 " || {
     echo "Ошибка при создании таблицы"
     exit 1
